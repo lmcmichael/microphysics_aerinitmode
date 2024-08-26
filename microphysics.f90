@@ -30,7 +30,7 @@ use grid, only: nx,ny,nzm,nz, &  !grid dimensions; nzm = nz-1 # of scalar lvls
      save2Dbin, save2Davg, nsave2D, &
      compute_reffc, compute_reffi, compute_reffl, &
      do_chunked_energy_budgets, nsaveMSE, &
-     isInitialized_scamiopdata
+     isInitialized_scamiopdata, donudging_transient
 
 use vars, only: pres, rho, dtn, w, t, tabs, qv, qcl, qpl, qci, qpi, &
      gamaz, rhow, tabs0, t0, q0, qv0, &
@@ -610,6 +610,15 @@ subroutine micro_setparm()
          flag_nudging(iqacc) = 1
      end if
 
+     !mcmic: add option to nudge aerosol even if aerinitmode==1 for cases
+     !when nudging is still turned on (donudging_transient = .true.)
+     if(doprogaerosol.AND.(aerinitmode.eq.1).AND.donudging_transient) then
+       ! Nudge aerosols that are read in from forcings in the same way you
+       !   would nudge water vapor
+         flag_nudging(inacc) = 1
+         flag_nudging(iqacc) = 1
+     end if
+
      ! by default, effective radii in microphysics will be used in radiation,
      !   though this can be changed in the namelist using douse_reff*
   compute_reffc = douse_reffc
@@ -944,6 +953,72 @@ subroutine micro_init()
 
        case(1)
 
+         !for the case when aerinitmode==1 and nudging is turned on (donudging_transient=.true.)
+         !interpolate number and mass profiles from provided sounding
+         if(donudging_transient) then
+
+           ! Use sounding information from aerosol input
+           !   This currently only works with SCAM IOP netcdf forcings
+           !   with accumulation mode aerosol number and mass mixing ratios
+           !   provided in the variables Na_accum and qa_accum.
+           if((.NOT.allocated(AccumAerosolNumber_snd)).AND.(.NOT.allocated(AccumAerosolMass_snd))) then
+             write(*,*) 'Error in MICRO_M2005_PA: initial conditions for accumulation mode'
+             write(*,*) '  aerosol when using aerinitmode==1 and donudging_transient=.true. should be specified in '
+             write(*,*) '  IOP netcdf file using the variables Na_accum and qa_accum.'
+             write(*,*) '********* Model stopping ... *************'
+             call task_abort()
+           end if
+
+           if((MINVAL(AccumAerosolNumber_snd).LT.0.).OR.MINVAL(AccumAerosolMass_snd).LT.0.) then
+             write(*,*) 'Error in MICRO_M2005_PA: Input initial condition for accumulation'
+             write(*,*) '  mode aerosol number and/or mass are not positive definite'
+             write(*,*) '  MAX/MIN(AccumAerosolNumber_snd) = ', MAXVAL(AccumAerosolNumber_snd), &
+                MINVAL(AccumAerosolNumber_snd)
+             write(*,*) '  MAX/MIN(AccumAerosolMass_snd) = ', MAXVAL(AccumAerosolMass_snd), &
+                MINVAL(AccumAerosolMass_snd)
+             write(*,*) 'If these numbers are -9999, they were likely missing values in the IOP netcdf file'
+             write(*,*) '********* Model stopping ... *************'
+             call task_abort()
+           end if
+
+           !borrow code from forcing.f90
+           call InterpolateFromForcings(nsnd,nzsnd,daysnd,zsnd,psnd,AccumAerosolNumber_snd, &
+                nzm,day,z,pres,Na_accum,.true.)
+           call InterpolateFromForcings(nsnd,nzsnd,daysnd,zsnd,psnd,AccumAerosolMass_snd, &
+                nzm,day,z,pres,qa_accum,.true.)
+
+           ! save profiles in mkobs.  They will be used for nudging in the
+           !   same way water vapor is nudged.
+           mkobs(1:nzm,inacc) = Na_accum(1:nzm)
+           mkobs(1:nzm,iqacc) = qa_accum(1:nzm)
+
+           if(masterproc) then
+             write(*,*) 'In MICRO_M2005_PA, using aerinitmode==1 and donudging_transient.  This means that '
+             write(*,*) '  the accumulation mode aerosol is initialized using soundings '
+             write(*,*) '  from the IOP netcdf forcing file.  Initial profile below ...'
+             write(*,*)
+             do k = 1,nzm
+                write(*,846) z(k), Na_accum(k), qa_accum(k), &
+                   ( qa_accum(k)/Na_accum(k) / EXP(9.*(log(aer_sig1)**2)/2.) &
+                  / ( rho_aerosol*4.*pi/3. ) )**(1./3.)
+                846 format('Accum Mode Aerosol: z, N, q, D = ', F10.2,3E14.6)
+             end do
+           end if
+
+           !bloss: Restructure aerosol initialization
+           !bloss(2020-11): Modify for new dry+cloud aerosol prognostic mass/number
+           do k = 1,nzm
+             do j = 1,ny
+               do i = 1,nx
+                 ! Nacc = NAd + NC (accumulation mode = dry aerosol + wet (in-cloud-droplet) aerosol).
+                 micro_field(i,j,k,inacc) = Na_accum(k)
+                 micro_field(i,j,k,iqacc) = qa_accum(k)
+               end do
+             end do
+           end do
+
+         end if
+
          ! Use aerosol mode 2 (aer_rm2, aer_n2, aer_sig2) to initialize aerosol above the inversion
 
          ! find inversion
@@ -1097,6 +1172,14 @@ subroutine micro_init()
 
    else      
      if(aerinitmode.eq.0) then
+       ! This mode requires aerosol fields from the SCAM IOP netcdf forcings
+       !   because they are used for aerosol nudging.  However, they probably have
+       !   not been read in yet, so make sure they are with the call below.
+       if(.NOT.isInitialized_scamiopdata) call readiopdata(status)
+     end if
+
+     !add possibility of specifying BL/FT aerosol and nudging from provided profile
+     if((aerinitmode.eq.1).AND.donudging_transient) then
        ! This mode requires aerosol fields from the SCAM IOP netcdf forcings
        !   because they are used for aerosol nudging.  However, they probably have
        !   not been read in yet, so make sure they are with the call below.
@@ -2662,6 +2745,15 @@ if(doprogaerosol.AND.(aerinitmode.eq.0)) then
   mkobs(1:nzm,iqacc) = tmp_profile(1:nzm)
 end if
 
+if(doprogaerosol.AND.(aerinitmode.eq.1).AND.donudging_transient) then
+  call InterpolateFromForcings(nsnd,nzsnd,daysnd,zsnd,psnd,AccumAerosolNumber_snd, &
+       nzm,day,z,pres,tmp_profile,.true.)
+  mkobs(1:nzm,inacc) = tmp_profile(1:nzm)
+
+  call InterpolateFromForcings(nsnd,nzsnd,daysnd,zsnd,psnd,AccumAerosolMass_snd, &
+       nzm,day,z,pres,tmp_profile,.true.)
+  mkobs(1:nzm,iqacc) = tmp_profile(1:nzm)
+end if
 
 end subroutine micro_diagnose
 
